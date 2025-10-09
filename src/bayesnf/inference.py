@@ -548,7 +548,7 @@ def fit_map(
     params_i, losses_i = ensemble_map(
         features,
         target,
-        objective_fn #orginally _neg_energy_fn,
+        objective_fn, #orginally _neg_energy_fn,
         prior_d=prior,
         init_fn=_make_init_fn(prior),
         ensemble_size=((num_particles // num_splits) // jax.device_count()),
