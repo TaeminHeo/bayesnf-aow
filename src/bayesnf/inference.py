@@ -346,6 +346,10 @@ def fit_vi(
     sample_size_posterior: int,
     kl_weight: float,
     batch_size: int | None = None,
+    *,  # --- NEW: keyword-only additions ---
+    loss_kind: Literal["nll", "aow"] = "nll",
+    aow_density: Optional[Callable[[jax.Array], jax.Array]] = None,
+    aow_eps: float = 1e-6,
 ) -> tuple[
     tfp.distributions.JointDistributionSequential, jax.Array, jax.Array
 ]:
@@ -357,10 +361,45 @@ def fit_vi(
         params, x, *make_model(**model_args), distribution
     ).log_prob(y)
 
+  # ==== NEW: AOW alternative (local, parallel to the original) ====
+  def _aow_neg_energy_fn(params, x, y):
+    if aow_density is None:
+      raise ValueError("aow_density must be provided when loss_kind='aow'.")
+
+    # Same observation distribution used by the NLL path
+    obs_dist = models.make_likelihood_model(
+        params, x, *make_model(**model_args), distribution
+    )
+
+    # Predictive mean (works for NORMAL / NB / ZINB)
+    yhat_mean = obs_dist.mean()  # shape: (batch, ...) == y.shape
+
+    # Densities with numerical safety; must broadcast over y's shape
+    py_true = jnp.clip(aow_density(y), aow_eps)          # shape == y.shape
+    py_hat  = jnp.clip(aow_density(yhat_mean), aow_eps)  # shape == y.shape
+
+    # AOW weight
+    w = (1.0 / py_true) + (py_true / py_hat)             # shape == y.shape
+
+    # Per-element squared error, then reduce ONLY over non-batch dims
+    sq_err = jnp.square(yhat_mean - y)                   # shape == y.shape
+    if y.ndim == 1:
+      per_sample = w * sq_err                            # (batch,)
+    else:
+      # collapse feature/event dims to match .log_prob(y) semantics
+      reduce_axes = tuple(range(1, y.ndim))
+      per_sample = jnp.sum(w * sq_err, axis=reduce_axes) # (batch,)
+
+    # Return "negative energy" per sample (vector), just like .log_prob(y)
+    return -per_sample
+  
+  # Choose which data term to use
+  objective_fn = _aow_neg_energy_fn if loss_kind == "aow" else _neg_energy_fn
+          
   return ensemble_vi(
       features,
       target,
-      _neg_energy_fn,
+      objective_fn, #orginally _neg_energy_fn,
       prior_d=make_prior(**model_args),
       ensemble_size=ensemble_size // jax.device_count(),
       learning_rate=learning_rate,
@@ -762,3 +801,28 @@ def ensemble_vi(
       losses,
       predictions,
   )
+
+def aow_neg_energy_fn(params, x_batch, y_batch):
+    # 1) Build likelihood & means using existing machinery
+    distribution = models.LikelihoodDist(observation_model)
+    forecast_inner = _make_forecast_inner(model_args, distribution)
+    means_tuple = forecast_parameters_batched(
+        x_batch, params, distribution, forecast_inner, batchsize=1024
+    )
+    if distribution == models.LikelihoodDist.NORMAL:
+        yhat_mean = means_tuple[0]  # loc
+    else:
+        obs_d = _build_observation_distribution(distribution, means_tuple)
+        yhat_mean = obs_d.mean()
+
+    # 2) Evaluate densities
+    py_true  = jnp.clip(aow_density.py(y_batch),  eps, None)
+    py_hat   = jnp.clip(aow_density.py(yhat_mean), eps, None)
+
+    # 3) AOW weight and loss (negative energy we’ll maximize)
+    w = (1.0/py_true) + (py_true/py_hat)
+    loss = jnp.mean(w * jnp.square(yhat_mean - y_batch))
+
+    # We return "neg_energy" (bigger is better inside VI/MAP plumbing),
+    # so use minus the loss:
+    return -loss
