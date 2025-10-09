@@ -15,8 +15,7 @@
 """Code to run inference using spatiotemporal BNF."""
 
 import functools
-from typing import Any
-from typing import Callable
+from typing import Any, Callable, Optional, Literal
 
 import flax
 import jax
