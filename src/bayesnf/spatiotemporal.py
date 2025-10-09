@@ -486,6 +486,9 @@ class BayesianNeuralFieldMAP(BayesianNeuralFieldEstimator):
       num_epochs=5_000,
       batch_size=None,
       num_splits=1,
+      *, # NEW: kw-only additions
+      loss_kind: Literal["nll","aow"] = "nll",
+      aow_eps: float = 1e-6,
       ) -> BayesianNeuralFieldEstimator:
     """Run inference using stochastic MAP ensembles.
 
@@ -573,6 +576,9 @@ class BayesianNeuralFieldVI(BayesianNeuralFieldEstimator):
       sample_size_divergence=5,
       kl_weight=0.1,
       batch_size=None,
+      *, # NEW: kw-only additions
+      loss_kind: Literal["nll","aow"] = "nll",
+      aow_eps: float = 1e-6,
       ) -> BayesianNeuralFieldEstimator:
     """Run inference using stochastic variational inference ensembles.
 
