@@ -442,14 +442,66 @@ def fit_map(
     prior_weight: float = 1.0,
     batch_size: int | None = None,
     num_splits: int = 1,
+    *,  # --- NEW: keyword-only additions ---
+    loss_kind: Literal["nll", "aow"] = "nll",
+    aow_eps: float = 1e-6,
 ) -> tuple[PyTree, np.ndarray]:
   """Fit a BNF using provided features and y data."""
   distribution = models.LikelihoodDist(observation_model)
-
+  aow_density = make_kde1d_density_fn(target)
+  
   def _neg_energy_fn(params, x, y):
     return models.make_likelihood_model(
         params, x, *make_model(**model_args), distribution
     ).log_prob(y)
+
+  # ---- NEW: AOW path (per-sample vector)
+  def _aow_neg_energy_fn(params, x, y):
+    # Build the same observation distribution
+    obs_dist = models.make_likelihood_model(
+        params, x, *make_model(**model_args), distribution
+    )
+    # Predictive mean; shape matches y
+    yhat_mean = obs_dist.mean()
+
+    # Data marginal p_y(y) via fixed KDE
+    py_true = jnp.clip(aow_density(y), aow_eps)
+
+    # Model marginal \hat p_y(yhat): small batch-KDE on current predictions (JAX-pure)
+    # Works for 1D targets; for multi-D, extend with per-dim KDE product (as in VI edit).
+    yhat_b = yhat_mean.reshape(yhat_mean.shape[0], -1)  # (B, D)
+    B, D = yhat_b.shape
+    inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+
+    if D == 1:
+      yh = yhat_b[:, 0]                                 # (B,)
+      sigma = jnp.std(yh)
+      h = jnp.maximum(1.06 * sigma * (B ** (-1/5)), aow_eps)
+      z = (yhat_mean[..., None] - yh[None, :]) / h      # (B, ..., B)
+      kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h
+      py_hat = jnp.clip(jnp.mean(kernels, axis=-1), aow_eps)   # shape like y
+    else:
+      # Factorized KDE across dims -> joint density; returns shape (B, …)
+      sigma = jnp.std(yhat_b, axis=0)                   # (D,)
+      h = jnp.maximum(1.06 * sigma * (B ** (-1/5)), aow_eps)   # (D,)
+      z = (yhat_mean[..., :, None] - yhat_b.T[None, :, :]) / h # (..., D, B)
+      kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h        # (..., D, B)
+      pd_per_dim = jnp.clip(jnp.mean(kernels, axis=-1), aow_eps)   # (..., D)
+      py_hat = jnp.prod(pd_per_dim, axis=-1)                      # (...,)
+
+    # AOW weights (elementwise); reduce over non-batch dims to get per-sample vector
+    w = (1.0 / py_true) + (py_true / py_hat)
+    sq_err = jnp.square(yhat_mean - y)
+
+    if y.ndim == 1:
+      per_sample = w * sq_err                     # (B,)
+    else:
+      per_sample = jnp.sum(w * sq_err, axis=tuple(range(1, y.ndim)))  # (B,)
+
+    return -per_sample
+
+  # Choose objective (third positional arg to ensemble_map)
+  objective_fn = _aow_neg_energy_fn if loss_kind == "aow" else _neg_energy_fn
 
   target_scale = np.nanstd(target)
 
@@ -496,7 +548,7 @@ def fit_map(
     params_i, losses_i = ensemble_map(
         features,
         target,
-        _neg_energy_fn,
+        objective_fn #orginally _neg_energy_fn,
         prior_d=prior,
         init_fn=_make_init_fn(prior),
         ensemble_size=((num_particles // num_splits) // jax.device_count()),
