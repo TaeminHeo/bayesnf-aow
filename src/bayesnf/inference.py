@@ -826,3 +826,67 @@ def aow_neg_energy_fn(params, x_batch, y_batch):
     # We return "neg_energy" (bigger is better inside VI/MAP plumbing),
     # so use minus the loss:
     return -loss
+
+# aow_density estimator
+def make_kde1d_density_fn(y_train: jnp.ndarray,
+                          bandwidth_scale: float = 1.0,
+                          eps: float = 1e-8):
+    """
+    Build a JAX-pure 1D KDE p(y) ≈ (1/N) Σ K_h(y - y_i), with Gaussian kernel.
+    Returns: a function aow_density(y) with same shape as y.
+    """
+    y_train = jnp.asarray(y_train).reshape(-1)  # (N,)
+    N = y_train.shape[0]
+    # Silverman's rule: h = 1.06 * sigma * N^{-1/5}
+    sigma = jnp.std(y_train)
+    h = jnp.maximum(1.06 * sigma * (N ** (-1/5)), eps) * bandwidth_scale
+
+    inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+
+    def aow_density(y: jnp.ndarray) -> jnp.ndarray:
+        # y shape: any. We'll broadcast over training points via an extra axis.
+        y = jnp.asarray(y)
+        # shape (..., 1) - (N,) -> (..., N)
+        diff = (y[..., None] - y_train[None, :]) / h
+        # Gaussian kernel along the last axis (training set)
+        kernels = inv_sqrt2pi * jnp.exp(-0.5 * diff * diff) / h  # (..., N)
+        # Average over training points -> (...,)
+        py = jnp.mean(kernels, axis=-1)
+        # Floor for numerical stability
+        return jnp.clip(py, eps, None)
+
+    return aow_density
+
+def make_kde_factorized_density_fn(y_train: jnp.ndarray,
+                                   bandwidth_scale: float = 1.0,
+                                   eps: float = 1e-8,
+                                   return_per_dim: bool = True):
+    """
+    Factorized KDE over dims: p(y) ≈ Π_d p_d(y_d), each p_d via 1D KDE.
+    If return_per_dim=True, returns per-dimension densities with shape (..., D),
+    suitable for elementwise AOW weights.
+    """
+    y_train = jnp.asarray(y_train)
+    if y_train.ndim == 1:
+        # fallback to 1D
+        return make_kde1d_density_fn(y_train, bandwidth_scale, eps)
+
+    N, D = y_train.shape
+    sigmas = jnp.std(y_train, axis=0)  # (D,)
+    hs = jnp.maximum(1.06 * sigmas * (N ** (-1/5)), eps) * bandwidth_scale  # (D,)
+    inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+
+    def aow_density(y: jnp.ndarray) -> jnp.ndarray:
+        # y: (..., D)
+        y = jnp.asarray(y)
+        # Broadcast: (..., D, 1) - (1, D, N) -> (..., D, N)
+        diff = (y[..., :, None] - y_train.T[None, :, :]) / hs  # hs broadcasts over D
+        kernels = inv_sqrt2pi * jnp.exp(-0.5 * diff * diff) / hs  # (..., D, N)
+        pd_per_dim = jnp.mean(kernels, axis=-1)  # (..., D)
+        pd_per_dim = jnp.clip(pd_per_dim, eps, None)
+        if return_per_dim:
+            return pd_per_dim  # elementwise per-dim density, matches y's shape
+        # If you prefer the joint (product) density:
+        return jnp.prod(pd_per_dim, axis=-1)  # (...,)
+
+    return aow_density
