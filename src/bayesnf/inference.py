@@ -348,13 +348,13 @@ def fit_vi(
     batch_size: int | None = None,
     *,  # --- NEW: keyword-only additions ---
     loss_kind: Literal["nll", "aow"] = "nll",
-    aow_density: Optional[Callable[[jax.Array], jax.Array]] = None,
     aow_eps: float = 1e-6,
 ) -> tuple[
     tfp.distributions.JointDistributionSequential, jax.Array, jax.Array
 ]:
   """Fit BNF using an ensemble VI."""
   distribution = models.LikelihoodDist(observation_model)
+  aow_density = make_kde1d_density_fn(target)
 
   def _neg_energy_fn(params, x, y):
     return models.make_likelihood_model(
@@ -366,33 +366,51 @@ def fit_vi(
     if aow_density is None:
       raise ValueError("aow_density must be provided when loss_kind='aow'.")
 
-    # Same observation distribution used by the NLL path
     obs_dist = models.make_likelihood_model(
         params, x, *make_model(**model_args), distribution
     )
+    yhat_mean = obs_dist.mean()  # shape like y
 
-    # Predictive mean (works for NORMAL / NB / ZINB)
-    yhat_mean = obs_dist.mean()  # shape: (batch, ...) == y.shape
+    # p_y from DATA (fixed KDE you passed in)
+    py_true = jnp.clip(aow_density(y), aow_eps)
 
-    # Densities with numerical safety; must broadcast over y's shape
-    py_true = jnp.clip(aow_density(y), aow_eps)          # shape == y.shape
-    py_hat  = jnp.clip(aow_density(yhat_mean), aow_eps)  # shape == y.shape
-
-    # AOW weight
-    w = (1.0 / py_true) + (py_true / py_hat)             # shape == y.shape
-
-    # Per-element squared error, then reduce ONLY over non-batch dims
-    sq_err = jnp.square(yhat_mean - y)                   # shape == y.shape
-    if y.ndim == 1:
-      per_sample = w * sq_err                            # (batch,)
+    # \hat p_y from MODEL (quick KDE over current batch predictions)
+    # bandwidth via Silverman on yhat_mean of the batch
+    yhat_flat = yhat_mean.reshape(yhat_mean.shape[0], -1)  # (B, D)
+    # handle 1D or multi-D by per-dim KDE then product or per-element use:
+    if yhat_flat.shape[1] == 1:
+      # 1D case
+      yh = yhat_flat[:, 0]
+      B = yh.shape[0]
+      sigma = jnp.std(yh)
+      h = jnp.maximum(1.06 * sigma * (B ** (-1/5)), aow_eps)
+      inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+      z = (yhat_mean[..., None] - yh[None, :]) / h             # (B,...,Bpred)
+      kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h        # (B,...,Bpred)
+      py_hat = jnp.clip(jnp.mean(kernels, axis=-1), aow_eps)   # (B,...)
     else:
-      # collapse feature/event dims to match .log_prob(y) semantics
-      reduce_axes = tuple(range(1, y.ndim))
-      per_sample = jnp.sum(w * sq_err, axis=reduce_axes) # (batch,)
+      # multi-D factorized KDE (per-dimension product)
+      B, D = yhat_flat.shape
+      sigma = jnp.std(yhat_flat, axis=0)                       # (D,)
+      h = jnp.maximum(1.06 * sigma * (B ** (-1/5)), aow_eps)   # (D,)
+      inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+      # broadcast: (..., D, 1) - (1, D, B) -> (..., D, B)
+      z = (yhat_mean[..., :, None] - yhat_flat.T[None, :, :]) / h
+      kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h        # (..., D, B)
+      pd_per_dim = jnp.clip(jnp.mean(kernels, axis=-1), aow_eps)  # (..., D)
+      py_hat = jnp.prod(pd_per_dim, axis=-1)                      # (...,)
 
-    # Return "negative energy" per sample (vector), just like .log_prob(y)
+    # AOW weight (elementwise)
+    w = (1.0 / py_true) + (py_true / py_hat)
+
+    sq_err = jnp.square(yhat_mean - y)
+    if y.ndim == 1:
+      per_sample = w * sq_err
+    else:
+      per_sample = jnp.sum(w * sq_err, axis=tuple(range(1, y.ndim)))
+
     return -per_sample
-  
+
   # Choose which data term to use
   objective_fn = _aow_neg_energy_fn if loss_kind == "aow" else _neg_energy_fn
           
@@ -826,3 +844,17 @@ def aow_neg_energy_fn(params, x_batch, y_batch):
     # We return "neg_energy" (bigger is better inside VI/MAP plumbing),
     # so use minus the loss:
     return -loss
+
+#aow_density estimation
+def make_kde1d_density_fn(y_train, eps=1e-8, bandwidth_scale=1.0):
+    y_train = jnp.asarray(y_train).reshape(-1)
+    N = y_train.shape[0]
+    sigma = jnp.std(y_train)
+    h = jnp.maximum(1.06 * sigma * (N ** (-1/5)), eps) * bandwidth_scale
+    inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+    def kde(y):
+        y = jnp.asarray(y)
+        z = (y[..., None] - y_train[None, :]) / h            # (..., N)
+        kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h    # (..., N)
+        return jnp.clip(jnp.mean(kernels, axis=-1), eps)
+    return kde
