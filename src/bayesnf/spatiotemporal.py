@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """API for Bayesian Neural Field estimators."""
-
+from typing import Any, Callable, Optional, Literal
 from collections.abc import Sequence
 
 import jax
