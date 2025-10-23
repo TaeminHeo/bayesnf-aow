@@ -540,7 +540,9 @@ class BayesianNeuralFieldMAP(BayesianNeuralFieldEstimator):
         num_epochs=num_epochs,
         prior_weight=self._prior_weight,
         batch_size=batch_size,
-        num_splits=num_splits)
+        num_splits=num_splits,
+        loss_kind=loss_kind,
+        aow_eps=aow_eps)
     return self
 
 
@@ -650,5 +652,7 @@ class BayesianNeuralFieldVI(BayesianNeuralFieldEstimator):
         sample_size_divergence=sample_size_divergence,
         kl_weight=kl_weight,
         batch_size=batch_size,
+        loss_kind=loss_kind,
+        aow_eps=aow_eps
     )
     return self
