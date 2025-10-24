@@ -408,7 +408,7 @@ def fit_vi(
     else:
       per_sample = jnp.sum(w * sq_err, axis=tuple(range(1, y.ndim)))
 
-    return -per_sample
+    return -jnp.mean(per_sample)
 
   # Choose which data term to use
   objective_fn = _aow_neg_energy_fn if loss_kind == "aow" else _neg_energy_fn
@@ -497,7 +497,7 @@ def fit_map(
     else:
       per_sample = jnp.sum(w * sq_err, axis=tuple(range(1, y.ndim)))  # (B,)
 
-    return -per_sample
+    return -jnp.mean(per_sample)
 
   # Choose objective (third positional arg to ensemble_map)
   objective_fn = _aow_neg_energy_fn if loss_kind == "aow" else _neg_energy_fn
