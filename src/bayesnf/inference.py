@@ -443,59 +443,97 @@ def fit_map(
     num_splits: int = 1,
     *,  # --- NEW: keyword-only additions ---
     loss_kind: Literal["nll", "aow"] = "nll",
-    aow_eps: float = 1e-6,
+    aow_eps: float = 1e-5,
+    aow_bins: np.ndarray | None = None,
+    aow_bin_probs: np.ndarray | None = None,
+    aow_pdf_interp: Literal["const", "linear"] = "const"
 ) -> tuple[PyTree, np.ndarray]:
   """Fit a BNF using provided features and y data."""
   distribution = models.LikelihoodDist(observation_model)
-  aow_density = make_kde1d_density_fn(target)
-  
+
+  # ---------------- AOW PMF PREP (host -> jax consts) ----------------
+  if loss_kind == "aow":
+    assert aow_bins is not None and aow_bin_probs is not None, \
+        "For loss_kind='aow', provide aow_bins (len N+1) and aow_bin_probs (len N)."
+    assert len(aow_bins) == len(aow_bin_probs) + 1, \
+        "aow_bins must have length N+1 and aow_bin_probs length N."
+
+    bins_np = np.asarray(aow_bins, dtype=np.float64)
+    probs_np = np.asarray(aow_bin_probs, dtype=np.float64)
+
+    # Monotonic bins, non-negative probs
+    assert np.all(np.isfinite(bins_np)) and np.all(np.diff(bins_np) > 0), "aow_bins must be strictly increasing."
+    assert np.all(probs_np >= 0) and np.isfinite(probs_np).all(), "aow_bin_probs must be finite and non-negative."
+
+    # Normalize masses
+    mass_sum = probs_np.sum()
+    if not np.isclose(mass_sum, 1.0):
+      if mass_sum <= 0:
+        raise ValueError("aow_bin_probs must sum to a positive value.")
+      probs_np = probs_np / mass_sum
+
+    widths_np = np.diff(bins_np)
+    # piecewise-constant pdf per bin
+    pdf_pc_np = probs_np / np.clip(widths_np, 1e-12, None)
+
+    # Midpoints & pdf at midpoints (for optional linear interpolation)
+    mids_np = 0.5 * (bins_np[:-1] + bins_np[1:])
+    pdf_mid_np = pdf_pc_np.copy()
+
+    # move to jax
+    bins_j = jnp.array(bins_np, dtype=jnp.float32)         # (N+1,)
+    pdf_pc_j = jnp.array(pdf_pc_np, dtype=jnp.float32)     # (N,)
+    mids_j   = jnp.array(mids_np, dtype=jnp.float32)       # (N,)
+    pdf_mid_j= jnp.array(pdf_mid_np, dtype=jnp.float32)    # (N,)
+    aow_eps_j= jnp.array(aow_eps, dtype=jnp.float32)
+
+    def _pdf_const(y: jnp.ndarray) -> jnp.ndarray:
+      # y -> bin index
+      idx = jnp.clip(jnp.searchsorted(bins_j, y, side="right") - 1, 0, pdf_pc_j.shape[0]-1)
+      return pdf_pc_j[idx]
+
+    def _pdf_linear(y: jnp.ndarray) -> jnp.ndarray:
+      # interpolate linearly on midpoints
+      # clamp y to midpoint range to avoid out-of-bounds
+      y_cl = jnp.clip(y, mids_j[0], mids_j[-1])
+      i = jnp.clip(jnp.searchsorted(mids_j, y_cl, side="right") - 1, 0, mids_j.shape[0]-2)
+      x0 = mids_j[i]
+      x1 = mids_j[i+1]
+      w1 = (y_cl - x0) / jnp.clip((x1 - x0), 1e-12)
+      return pdf_mid_j[i] * (1.0 - w1) + pdf_mid_j[i+1] * w1
+
+    _pmf_pdf_lookup = _pdf_const if aow_pdf_interp == "const" else _pdf_linear
+
+  # ---------------- Objectives ----------------
   def _neg_energy_fn(params, x, y):
     return models.make_likelihood_model(
         params, x, *make_model(**model_args), distribution
     ).log_prob(y)
 
-  # ---- NEW: AOW path (per-sample vector)
   def _aow_neg_energy_fn(params, x, y):
-    # Build the same observation distribution
     obs_dist = models.make_likelihood_model(
         params, x, *make_model(**model_args), distribution
     )
-    # Predictive mean; shape matches y
     yhat_mean = obs_dist.mean()
 
-    # Data marginal p_y(y) via fixed KDE
-    py_true = jnp.clip(aow_density(y), aow_eps)
+    # clamp to bin support to avoid NaNs outside given range
+    # If your variable is known >=0 (e.g., wave heights), you can also jnp.clip(y, 0, None)
+    y_true_cl = jnp.clip(y,       bins_j[0] + 0.0, bins_j[-1] - 1e-6)
+    y_pred_cl = jnp.clip(yhat_mean, bins_j[0] + 0.0, bins_j[-1] - 1e-6)
 
-    # Model marginal \hat p_y(yhat): small batch-KDE on current predictions (JAX-pure)
-    # Works for 1D targets; for multi-D, extend with per-dim KDE product (as in VI edit).
-    yhat_b = yhat_mean.reshape(yhat_mean.shape[0], -1)  # (B, D)
-    B, D = yhat_b.shape
-    inv_sqrt2pi = 1.0 / jnp.sqrt(2.0 * jnp.pi)
+    py_true = _pmf_pdf_lookup(y_true_cl)
+    py_pred = _pmf_pdf_lookup(y_pred_cl)
 
-    if D == 1:
-      yh = yhat_b[:, 0]                                 # (B,)
-      sigma = jnp.std(yh)
-      h = jnp.maximum(1.06 * sigma * (B ** (-1/5)), aow_eps)
-      z = (yhat_mean[..., None] - yh[None, :]) / h      # (B, ..., B)
-      kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h
-      py_hat = jnp.clip(jnp.mean(kernels, axis=-1), aow_eps)   # shape like y
-    else:
-      # Factorized KDE across dims -> joint density; returns shape (B, …)
-      sigma = jnp.std(yhat_b, axis=0)                   # (D,)
-      h = jnp.maximum(1.06 * sigma * (B ** (-1/5)), aow_eps)   # (D,)
-      z = (yhat_mean[..., :, None] - yhat_b.T[None, :, :]) / h # (..., D, B)
-      kernels = inv_sqrt2pi * jnp.exp(-0.5 * z * z) / h        # (..., D, B)
-      pd_per_dim = jnp.clip(jnp.mean(kernels, axis=-1), aow_eps)   # (..., D)
-      py_hat = jnp.prod(pd_per_dim, axis=-1)                      # (...,)
+    py_true = jnp.clip(py_true, aow_eps_j, None)
+    py_pred = jnp.clip(py_pred, aow_eps_j, None)
 
-    # AOW weights (elementwise); reduce over non-batch dims to get per-sample vector
-    w = (1.0 / py_true) + (py_true / py_hat)
+    w = (1.0 / py_true) + (py_true / py_pred)
     sq_err = jnp.square(yhat_mean - y)
 
     if y.ndim == 1:
-      per_sample = w * sq_err                     # (B,)
+      per_sample = w * sq_err
     else:
-      per_sample = jnp.sum(w * sq_err, axis=tuple(range(1, y.ndim)))  # (B,)
+      per_sample = jnp.sum(w * sq_err, axis=tuple(range(1, y.ndim)))
 
     return -jnp.mean(per_sample)
 
