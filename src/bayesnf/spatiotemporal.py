@@ -489,6 +489,9 @@ class BayesianNeuralFieldMAP(BayesianNeuralFieldEstimator):
       *, # NEW: kw-only additions
       loss_kind: Literal["nll","aow"] = "nll",
       aow_eps: float = 1e-6,
+      aow_bins: np.ndarray | None = None,
+      aow_bin_probs: np.ndarray | None = None,
+      aow_pdf_interp: Literal["const", "linear"] = "const",
       ) -> BayesianNeuralFieldEstimator:
     """Run inference using stochastic MAP ensembles.
 
@@ -542,7 +545,10 @@ class BayesianNeuralFieldMAP(BayesianNeuralFieldEstimator):
         batch_size=batch_size,
         num_splits=num_splits,
         loss_kind=loss_kind,
-        aow_eps=aow_eps)
+        aow_eps=aow_eps,
+        aow_bins=aow_bins,
+        aow_bin_probs=aow_bin_probs,
+        aow_pdf_interp=aow_pdf_interp)
     return self
 
 
